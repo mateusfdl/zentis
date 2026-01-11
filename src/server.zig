@@ -3,21 +3,36 @@
 //! This module implements an event-driven server using poll() for scalability.
 //! It handles multiple concurrent connections without threads or async.
 
+var global_server: ?*Server = null;
+
 const std = @import("std");
 const logger = @import("logger.zig");
 const net = @import("net.zig");
+const protocol = @import("protocol.zig");
+const pubsub_mod = @import("pubsub.zig");
+const client_mod = @import("client.zig");
 
 const MAX_CONNECTIONS = 1024;
 
-/// TCP server with an event loop.
-/// It owns the listening socket and manages all active connections.
+const ErrorCodes = enum(u8) {
+    UNKNOWN_MESSAGE = 1,
+    INVALID_PAYLOAD = 2,
+    NOT_AUTHENTICATED = 3,
+    CHANNEL_NOT_FOUND = 4,
+    ALREADY_SUBSCRIBED = 5,
+    NOT_SUBSCRIBED = 6,
+    INTERNAL_ERROR = 7,
+};
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     listener: std.net.Server,
     address: std.net.Address,
-
-    /// Map from file descriptor to connection
     connections: std.AutoHashMap(std.posix.fd_t, net.Connection),
+    parsers: std.AutoHashMap(std.posix.fd_t, protocol.MessageParser),
+    clients: std.AutoHashMap(std.posix.fd_t, client_mod.ClientState),
+    pubsub: pubsub_mod.PubSub,
+    msg_builder: protocol.MessageBuilder,
 
     shutdown: bool,
 
@@ -31,12 +46,15 @@ pub const Server = struct {
             .listener = listener,
             .address = listener.listen_address,
             .connections = std.AutoHashMap(std.posix.fd_t, net.Connection).init(allocator),
+            .parsers = std.AutoHashMap(std.posix.fd_t, protocol.MessageParser).init(allocator),
+            .clients = std.AutoHashMap(std.posix.fd_t, client_mod.ClientState).init(allocator),
+            .pubsub = pubsub_mod.PubSub.init(allocator),
+            .msg_builder = protocol.MessageBuilder.init(allocator),
             .shutdown = false,
         };
     }
 
-    /// Start the server event loop.
-    /// This function blocks until the server is stopped.
+    /// start event loop.
     pub fn run(self: *Server) !void {
         var addr_ctx = logger.NetCtx.init(self.address);
 
@@ -49,15 +67,14 @@ pub const Server = struct {
         logger.info("Event loop exited", .{});
     }
 
-    /// Single iteration of the event loop using poll().
+    /// single iteration of the event loop using poll().
     fn eventLoop(self: *Server) !void {
-        // Allocate space for listener + all connections
         var pollfds = try self.allocator.alloc(std.posix.pollfd, MAX_CONNECTIONS + 1);
         defer self.allocator.free(pollfds);
 
         var nfds: usize = 0;
 
-        // Add listener socket if not shutting down
+        // add listener socket if not shutting down
         if (!self.shutdown) {
             pollfds[nfds] = .{
                 .fd = self.listener.stream.handle,
@@ -67,7 +84,7 @@ pub const Server = struct {
             nfds += 1;
         }
 
-        // Add all connection sockets
+        // add all connection sockets
         var conn_iter = self.connections.iterator();
         while (conn_iter.next()) |entry| {
             const conn = entry.value_ptr;
@@ -75,7 +92,7 @@ pub const Server = struct {
 
             var events: i16 = std.posix.POLL.IN;
 
-            // Only register for POLLOUT if we have data to write
+            // only register for pollout if we have data to write
             if (conn.hasDataToWrite()) {
                 events |= std.posix.POLL.OUT;
             }
@@ -88,10 +105,8 @@ pub const Server = struct {
             nfds += 1;
         }
 
-        // Wait for events (timeout: 1 second to check shutdown flag)
         const ready = std.posix.poll(pollfds[0..nfds], 1000) catch |err| {
             // EINTR means poll() was interrupted by a signal (e.g., SIGINT/SIGTERM)
-            // This is expected during shutdown, so just continue the loop
             if (err == error.Interrupted) {
                 return;
             }
@@ -100,14 +115,13 @@ pub const Server = struct {
         };
 
         if (ready == 0) {
-            // Timeout - no events
             return;
         }
 
         for (pollfds[0..nfds]) |pollfd| {
             if (pollfd.revents == 0) continue;
 
-            // Check if this is the listener socket
+            // check if this is the listener socket
             if (!self.shutdown and pollfd.fd == self.listener.stream.handle) {
                 if (pollfd.revents & std.posix.POLL.IN != 0) {
                     self.acceptConnection() catch |err| {
@@ -118,19 +132,19 @@ pub const Server = struct {
                 // This is a client connection
                 if (pollfd.revents & std.posix.POLL.IN != 0) {
                     self.handleRead(pollfd.fd) catch |err| {
-                        logger.debug("Error reading from fd {}: {}", .{pollfd.fd, err});
+                        logger.debug("Error reading from fd {}: {}", .{ pollfd.fd, err });
                         self.closeConnection(pollfd.fd);
                     };
                 }
 
                 if (pollfd.revents & std.posix.POLL.OUT != 0) {
                     self.handleWrite(pollfd.fd) catch |err| {
-                        logger.debug("Error writing to fd {}: {}", .{pollfd.fd, err});
+                        logger.debug("Error writing to fd {}: {}", .{ pollfd.fd, err });
                         self.closeConnection(pollfd.fd);
                     };
                 }
 
-                // Check for errors or hangup
+                // check for errors or hangup
                 if (pollfd.revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0) {
                     logger.debug("Connection fd {} error/hangup", .{pollfd.fd});
                     self.closeConnection(pollfd.fd);
@@ -148,17 +162,21 @@ pub const Server = struct {
             return err;
         };
 
-        // Create a Connection with buffers
         const conn = try net.Connection.init(self.allocator, accepted.stream.handle, accepted.address);
+        const parser = protocol.MessageParser.init(self.allocator);
+        const client = client_mod.ClientState.init(self.allocator, conn.fd);
 
         try self.connections.put(conn.fd, conn);
+        try self.parsers.put(conn.fd, parser);
+        try self.clients.put(conn.fd, client);
 
         var peer_ctx = logger.NetCtx.init(conn.peer_address);
-        logger.info("New connection from {s} (fd {})", .{peer_ctx.str(), conn.fd});
+        logger.info("New connection from {s} (fd {})", .{ peer_ctx.str(), conn.fd });
     }
 
     fn handleRead(self: *Server, fd: std.posix.fd_t) !void {
         var conn = self.connections.getPtr(fd) orelse return error.ConnectionNotFound;
+        var parser = self.parsers.getPtr(fd) orelse return error.ParserNotFound;
 
         const bytes_read = std.posix.read(conn.fd, &conn.read_buf) catch |err| {
             // WouldBlock means no data available (shouldn't happen after poll)
@@ -175,25 +193,31 @@ pub const Server = struct {
         }
 
         var peer_ctx = logger.NetCtx.init(conn.peer_address);
-        logger.debug("Read {} bytes from {s}", .{bytes_read, peer_ctx.str()});
+        logger.debug("Read {} bytes from {s}", .{ bytes_read, peer_ctx.str() });
 
-        const written = conn.write_buf.write(conn.read_buf[0..bytes_read]);
-        if (written < bytes_read) {
-            logger.warn("Write buffer full, dropped {} bytes", .{bytes_read - written});
+        try parser.feed(conn.read_buf[0..bytes_read]);
+
+        while (try parser.next()) |msg| {
+            self.handleMessage(fd, msg) catch |err| {
+                logger.err("Error handling message from fd {}: {}", .{ fd, err });
+                if (err == error.UnknownMessageType or err == error.MessageTooLarge) {
+                    self.sendError(fd, @intFromEnum(ErrorCodes.UNKNOWN_MESSAGE), "Protocol error") catch {};
+                    self.closeConnection(fd);
+                }
+            };
+            parser.consume(msg.total_len);
         }
     }
 
-    /// Handle a write event on a connection.
     fn handleWrite(self: *Server, fd: std.posix.fd_t) !void {
         var conn = self.connections.getPtr(fd) orelse return error.ConnectionNotFound;
 
         const data = conn.write_buf.peekReadable();
         if (data.len == 0) {
-            return; // Nothing to write
+            return;
         }
 
         const bytes_written = std.posix.write(conn.fd, data) catch |err| {
-            // WouldBlock means socket not ready (shouldn't happen after poll)
             if (err == error.WouldBlock) {
                 return;
             }
@@ -203,15 +227,198 @@ pub const Server = struct {
         conn.write_buf.consume(bytes_written);
 
         var peer_ctx = logger.NetCtx.init(conn.peer_address);
-        logger.debug("Wrote {} bytes to {s}", .{bytes_written, peer_ctx.str()});
+        logger.debug("Wrote {} bytes to {s}", .{ bytes_written, peer_ctx.str() });
+    }
+
+    fn handleMessage(self: *Server, fd: std.posix.fd_t, msg: protocol.Message) !void {
+        logger.debug("Handling message type: {} (fd {})", .{ msg.msg_type, fd });
+
+        switch (msg.msg_type) {
+            .CONNECT => try self.handleConnect(fd, msg.payload),
+            .SUBSCRIBE => try self.handleSubscribe(fd, msg.payload),
+            .UNSUBSCRIBE => try self.handleUnsubscribe(fd, msg.payload),
+            .PUBLISH => try self.handlePublish(fd, msg.payload),
+            .PING => try self.sendPong(fd),
+            else => {
+                logger.warn("Unhandled message type: {} (fd {})", .{ msg.msg_type, fd });
+                try self.sendError(fd, @intFromEnum(ErrorCodes.UNKNOWN_MESSAGE), "Unhandled message type");
+            },
+        }
+    }
+
+    /// Handle CONNECT message.
+    fn handleConnect(self: *Server, fd: std.posix.fd_t, payload: []const u8) !void {
+        var client = self.clients.getPtr(fd) orelse return error.ClientNotFound;
+
+        if (client.authenticated) {
+            try self.sendError(fd, @intFromEnum(ErrorCodes.ALREADY_SUBSCRIBED), "Already authenticated");
+            return;
+        }
+
+        const connect = protocol.Message{ .msg_type = .CONNECT, .payload = payload, .total_len = 0 };
+        const auth = connect.parseConnect() catch |err| {
+            logger.err("Invalid CONNECT payload: {}", .{err});
+            try self.sendError(fd, @intFromEnum(ErrorCodes.INVALID_PAYLOAD), "Invalid CONNECT format");
+            return;
+        };
+
+        // For now, accept any auth token (no real authentication)
+        try client.authenticate(auth.auth_token);
+
+        // Send CONNECTED response with connection ID
+        var conn_id_buf: [32]u8 = undefined;
+        const conn_id = std.fmt.bufPrint(&conn_id_buf, "conn-{}", .{fd}) catch "unknown";
+        try self.sendMessageTo(.CONNECTED, conn_id, fd);
+
+        logger.info("Client fd {} authenticated with token '{s}'", .{ fd, auth.auth_token });
+    }
+
+    fn handleSubscribe(self: *Server, fd: std.posix.fd_t, payload: []const u8) !void {
+        var client = self.clients.getPtr(fd) orelse return error.ClientNotFound;
+
+        const msg = protocol.Message{ .msg_type = .SUBSCRIBE, .payload = payload, .total_len = 0 };
+        const channel_name = msg.parseSubscribe() catch |err| {
+            logger.err("Invalid SUBSCRIBE payload: {}", .{err});
+            try self.sendError(fd, @intFromEnum(ErrorCodes.INVALID_PAYLOAD), "Invalid SUBSCRIBE format");
+            return;
+        };
+
+        const newly_subscribed = try self.pubsub.subscribe(fd, channel_name);
+        if (newly_subscribed) {
+            try client.addSubscription(channel_name);
+            try self.sendMessageTo(.SUBSCRIBED, channel_name, fd);
+            logger.info("Client fd {} subscribed to channel '{s}'", .{ fd, channel_name });
+        } else {
+            logger.debug("Client fd {} already subscribed to '{s}'", .{ fd, channel_name });
+        }
+    }
+
+    fn handleUnsubscribe(self: *Server, fd: std.posix.fd_t, payload: []const u8) !void {
+        var client = self.clients.getPtr(fd) orelse return error.ClientNotFound;
+
+        const msg = protocol.Message{ .msg_type = .UNSUBSCRIBE, .payload = payload, .total_len = 0 };
+        const channel_name = msg.parseUnsubscribe() catch |err| {
+            logger.err("Invalid UNSUBSCRIBE payload: {}", .{err});
+            try self.sendError(fd, @intFromEnum(ErrorCodes.INVALID_PAYLOAD), "Invalid UNSUBSCRIBE format");
+            return;
+        };
+
+        const was_subscribed = self.pubsub.unsubscribe(fd, channel_name);
+
+        if (was_subscribed) {
+            _ = client.removeSubscription(channel_name);
+            try self.sendMessageTo(.UNSUBSCRIBED, channel_name, fd);
+            logger.info("Client fd {} unsubscribed from channel '{s}'", .{ fd, channel_name });
+        } else {
+            try self.sendError(fd, @intFromEnum(ErrorCodes.NOT_SUBSCRIBED), "Not subscribed to channel");
+        }
+    }
+
+    fn handlePublish(self: *Server, fd: std.posix.fd_t, payload: []const u8) !void {
+        const msg = protocol.Message{ .msg_type = .PUBLISH, .payload = payload, .total_len = 0 };
+        const publish = msg.parsePublish() catch |err| {
+            logger.err("Invalid PUBLISH payload: {}", .{err});
+            try self.sendError(fd, @intFromEnum(ErrorCodes.INVALID_PAYLOAD), "Invalid PUBLISH format");
+            return;
+        };
+
+        const recipient_count = self.pubsub.publish(publish.channel, publish.data, fd);
+
+        const subscribers = try self.pubsub.getSubscribers(self.allocator, publish.channel, fd);
+        defer self.allocator.free(subscribers);
+
+        for (subscribers) |sub_fd| {
+            self.sendMessageToClient(.MESSAGE, publish.channel, publish.data, sub_fd) catch |err| {
+                logger.err("Failed to send message to fd {}: {}", .{ sub_fd, err });
+            };
+        }
+
+        logger.info("Client fd {} published to channel '{s}' ({} recipients)", .{ fd, publish.channel, recipient_count });
+    }
+
+    fn sendMessageToClient(
+        self: *Server,
+        msg_type: protocol.MessageType,
+        channel: []const u8,
+        data: []const u8,
+        fd: std.posix.fd_t,
+    ) !void {
+        _ = msg_type;
+        const msg_bytes = try self.msg_builder.buildChannelMessage(channel, data);
+        defer self.msg_builder.allocator.free(msg_bytes);
+
+        var conn = self.connections.getPtr(fd) orelse return error.ConnectionNotFound;
+
+        const written = conn.write_buf.write(msg_bytes);
+        if (written < msg_bytes.len) {
+            logger.warn("Write buffer full for fd {}, dropped {} bytes", .{ fd, msg_bytes.len - written });
+        }
+    }
+
+    /// send a string message to a specific client.
+    fn sendMessageTo(self: *Server, msg_type: protocol.MessageType, str: []const u8, fd: std.posix.fd_t) !void {
+        const msg_bytes = switch (msg_type) {
+            .CONNECTED => try self.msg_builder.buildConnected(str),
+            .SUBSCRIBED => try self.msg_builder.buildSubscribed(str),
+            .UNSUBSCRIBED => try self.msg_builder.buildUnsubscribed(str),
+            else => return error.UnsupportedMessageType,
+        };
+        defer self.msg_builder.allocator.free(msg_bytes);
+
+        var conn = self.connections.getPtr(fd) orelse return error.ConnectionNotFound;
+
+        const written = conn.write_buf.write(msg_bytes);
+        if (written < msg_bytes.len) {
+            logger.warn("Write buffer full for fd {}, dropped {} bytes", .{ fd, msg_bytes.len - written });
+        }
+    }
+
+    fn sendPong(self: *Server, fd: std.posix.fd_t) !void {
+        const msg_bytes = try self.msg_builder.buildPong();
+        defer self.msg_builder.allocator.free(msg_bytes);
+
+        var conn = self.connections.getPtr(fd) orelse return error.ConnectionNotFound;
+
+        const written = conn.write_buf.write(msg_bytes);
+        if (written < msg_bytes.len) {
+            logger.warn("Write buffer full for fd {}, dropped {} bytes", .{ fd, msg_bytes.len - written });
+        }
+    }
+
+    fn sendError(self: *Server, fd: std.posix.fd_t, error_code: u8, error_msg: []const u8) !void {
+        const msg_bytes = try self.msg_builder.buildError(error_code, error_msg);
+        defer self.msg_builder.allocator.free(msg_bytes);
+
+        var conn = self.connections.getPtr(fd) orelse return error.ConnectionNotFound;
+
+        const written = conn.write_buf.write(msg_bytes);
+        if (written < msg_bytes.len) {
+            logger.warn("Write buffer full for fd {}, dropped {} bytes", .{ fd, msg_bytes.len - written });
+        }
     }
 
     fn closeConnection(self: *Server, fd: std.posix.fd_t) void {
+        var peer_ctx_val: ?logger.NetCtx = null;
+
         if (self.connections.fetchRemove(fd)) |entry| {
             var conn = entry.value;
-            var peer_ctx = logger.NetCtx.init(conn.peer_address);
-            logger.info("Connection from {s} closed (fd {})", .{peer_ctx.str(), fd});
+            peer_ctx_val = logger.NetCtx.init(conn.peer_address);
             conn.deinit();
+        }
+
+        if (self.parsers.fetchRemove(fd)) |entry| {
+            var parser = entry.value;
+            parser.deinit();
+        }
+
+        if (self.clients.fetchRemove(fd)) |entry| {
+            var client = entry.value;
+            self.pubsub.removeConnection(fd);
+            client.deinit();
+        }
+
+        if (peer_ctx_val) |ctx| {
+            logger.info("Connection from {s} closed (fd {})", .{ ctx.strConst(), fd });
         }
     }
 
@@ -232,14 +439,25 @@ pub const Server = struct {
         }
         self.connections.deinit();
 
+        var parser_iter = self.parsers.iterator();
+        while (parser_iter.next()) |entry| {
+            var parser = entry.value_ptr;
+            parser.deinit();
+        }
+        self.parsers.deinit();
+
+        var client_iter = self.clients.iterator();
+        while (client_iter.next()) |entry| {
+            var client = entry.value_ptr;
+            client.deinit();
+        }
+
+        self.clients.deinit();
+        self.pubsub.deinit();
         self.listener.deinit();
     }
 };
 
-/// Global server instance for signal handling
-var global_server: ?*Server = null;
-
-/// Signal handler for SIGINT (Ctrl+C) and SIGTERM (kill command)
 fn handleSignal(sig: c_int) callconv(.c) void {
     _ = sig;
     if (global_server) |server| {
@@ -247,20 +465,17 @@ fn handleSignal(sig: c_int) callconv(.c) void {
     }
 }
 
-/// Helper function to run a server with proper cleanup and signal handling.
-/// This is useful for main.zig to keep the code simple.
 pub fn run(allocator: std.mem.Allocator, address: []const u8) !void {
     var server = try Server.init(allocator, address);
     defer server.deinit();
 
-    // Set up signal handler for graceful shutdown
     global_server = &server;
     const sig_action = std.posix.Sigaction{
         .handler = .{ .handler = handleSignal },
         .mask = std.mem.zeroes(std.posix.sigset_t),
         .flags = 0,
     };
-    // Handle both SIGINT (Ctrl+C) and SIGTERM (kill command)
+
     _ = std.posix.sigaction(std.posix.SIG.INT, &sig_action, null);
     _ = std.posix.sigaction(std.posix.SIG.TERM, &sig_action, null);
 
