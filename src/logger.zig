@@ -13,8 +13,7 @@ pub const Level = enum {
     err,
 };
 
-/// format a network address into a fixed buffer as "ip:port".
-/// returns the formatted string slice.
+/// returns the formatted string slice as "ip:port"
 pub fn formatAddress(address: std.net.Address, buf: []u8) []const u8 {
     if (address.any.family == std.posix.AF.INET) {
         const ip_bytes = @as(*const [4]u8, @ptrCast(&address.in.sa.addr));
@@ -42,8 +41,7 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
     std.log.err(fmt, args);
 }
 
-/// context-aware logger for network operations.
-/// adds automatic address formatting to reduce repetition.
+/// context logger for network operations.
 pub const NetCtx = struct {
     address: std.net.Address,
     addr_buf: [32]u8 = undefined,
@@ -56,7 +54,6 @@ pub const NetCtx = struct {
         return formatAddress(self.address, &self.addr_buf);
     }
 
-    /// get the formatted address string (const version).
     pub fn strConst(self: NetCtx) []const u8 {
         var addr_buf: [32]u8 = undefined;
         return formatAddress(self.address, &addr_buf);

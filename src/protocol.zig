@@ -215,7 +215,6 @@ pub const MessageParser = struct {
         self.allocator.free(self.buffer);
     }
 
-    /// feed incoming data to the parser. appends to internal buffer
     pub fn feed(self: *MessageParser, data: []const u8) !void {
         // prevent unbounded buffer growth
         if (self.len + data.len > self.max_message_size * 2) {
@@ -236,7 +235,6 @@ pub const MessageParser = struct {
             self.capacity = new_capacity;
         }
 
-        // append
         @memcpy(self.buffer[self.len..][0..data.len], data);
         self.len += data.len;
     }
@@ -255,7 +253,6 @@ pub const MessageParser = struct {
         const type_id = std.mem.readInt(u16, self.buffer[0..2], .big);
         const payload_len = std.mem.readInt(u16, self.buffer[2..4], .big);
 
-        // validate
         if (payload_len > self.max_message_size) {
             return error.MessageTooLarge;
         }
@@ -267,13 +264,11 @@ pub const MessageParser = struct {
             return null;
         }
 
-        // parse message type
         const msg_type = MessageType.fromInt(type_id) orelse {
             logger.warn("Unknown message type: {}", .{type_id});
             return error.UnknownMessageType;
         };
 
-        // extract payload
         const payload = self.buffer[4..total_len];
 
         return Message{
@@ -297,12 +292,10 @@ pub const MessageParser = struct {
         }
     }
 
-    /// get the number of bytes currently buffered.
     pub fn buffered(self: *const MessageParser) usize {
         return self.len;
     }
 
-    /// clear all buffered data (e.g., after a protocol error).
     pub fn clear(self: *MessageParser) void {
         self.len = 0;
     }
@@ -313,11 +306,10 @@ test "MessageParser: parse complete CONNECT message" {
     var parser = MessageParser.init(testing.allocator);
     defer parser.deinit();
 
-    // Build a CONNECT message manually
     var buffer: [10]u8 = undefined;
     std.mem.writeInt(u16, buffer[0..2], @intFromEnum(MessageType.CONNECT), .big);
     std.mem.writeInt(u16, buffer[2..4], 1, .big); // payload length
-    buffer[4] = 0; // auth token length = 0 (empty)
+    buffer[4] = 0;
 
     try parser.feed(&buffer);
 
@@ -334,15 +326,14 @@ test "MessageParser: fragmented message" {
     var parser = MessageParser.init(testing.allocator);
     defer parser.deinit();
 
-    // Header first
     var header: [4]u8 = undefined;
     std.mem.writeInt(u16, header[0..2], @intFromEnum(MessageType.PING), .big);
     std.mem.writeInt(u16, header[2..4], 0, .big); // empty payload
 
-    try parser.feed(header[0..2]); // Partial header
+    try parser.feed(header[0..2]);
     try testing.expectEqual(@as(?Message, null), try parser.next());
 
-    try parser.feed(header[2..]); // Rest of header
+    try parser.feed(header[2..]);
     const msg = (try parser.next()).?;
     try testing.expectEqual(MessageType.PING, msg.msg_type);
 }
@@ -354,9 +345,8 @@ test "MessageBuilder: build CONNECTED message" {
     const msg = try builder.buildConnected("conn-123");
     defer builder.free(msg);
 
-    try testing.expectEqual(@as(usize, 12), msg.len); // 4 + 1 + 7
+    try testing.expectEqual(@as(usize, 12), msg.len);
 
-    // Verify header
     const type_id = std.mem.readInt(u16, msg[0..2], .big);
     try testing.expectEqual(@intFromEnum(MessageType.CONNECTED), type_id);
 }

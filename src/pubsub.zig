@@ -65,11 +65,10 @@ pub const Channel = struct {
     }
 };
 
-/// PubSub engine managing all channels and subscriptions.
 pub const PubSub = struct {
     allocator: std.mem.Allocator,
     channels: std.StringHashMap(*Channel),
-    /// Track which channels each connection is subscribed to (fd -> channel names)
+    /// track which channels each connection is subscribed to (fd -> channel names)
     connection_subscriptions: std.AutoHashMap(std.posix.fd_t, std.StringHashMap(void)),
 
     pub fn init(allocator: std.mem.Allocator) PubSub {
@@ -96,25 +95,19 @@ pub const PubSub = struct {
         self.connection_subscriptions.deinit();
     }
 
-    /// subscribe a connection to a channel.
-    /// returns true if newly subscribed, false if already subscribed.
     pub fn subscribe(self: *PubSub, fd: std.posix.fd_t, channel_name: []const u8) !bool {
-        // Check if channel already exists
         var channel: *Channel = undefined;
         if (self.channels.get(channel_name)) |existing_channel| {
             channel = existing_channel;
         } else {
-            // Create new channel first, then use its owned name as the key
             const new_channel = try self.allocator.create(Channel);
             new_channel.* = Channel.init(self.allocator, channel_name);
-            // IMPORTANT: Use the channel's owned name as the key, not the temporary slice
             try self.channels.put(new_channel.name, new_channel);
             channel = new_channel;
         }
 
         const newly_subscribed = try channel.subscribe(fd);
 
-        // track subscription for the connection
         if (newly_subscribed) {
             const conn_subs = try self.connection_subscriptions.getOrPut(fd);
             if (!conn_subs.found_existing) {
@@ -126,15 +119,12 @@ pub const PubSub = struct {
         return newly_subscribed;
     }
 
-    /// unsubscribe a connection from a channel.
-    /// returns true if was subscribed, false if not.
     pub fn unsubscribe(self: *PubSub, fd: std.posix.fd_t, channel_name: []const u8) bool {
         const channel = self.channels.get(channel_name) orelse return false;
 
         const was_subscribed = channel.unsubscribe(fd);
 
         if (was_subscribed) {
-            // remove from connection's subscription tracking
             if (self.connection_subscriptions.getPtr(fd)) |subs| {
                 _ = subs.remove(channel_name);
             }
@@ -158,7 +148,6 @@ pub const PubSub = struct {
             return allocator.alloc(std.posix.fd_t, 0);
         };
 
-        // count recipients
         var recipient_count: usize = 0;
         for (channel.subscribers[0..channel.count]) |fd| {
             if (exclude_fd) |exclude| {

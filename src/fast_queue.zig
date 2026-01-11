@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-/// FastQueue provides a fixed-size circular buffer for byte storage.
+/// A fixed-size circular buffer for byte storage.
 /// It's useful for handling partial writes where we need to buffer data
 /// until the socket is ready to write more.
 pub const FastQueue = struct {
@@ -54,7 +54,6 @@ pub const FastQueue = struct {
         return self.full;
     }
 
-    /// Write data into the ring buffer.
     /// Returns the number of bytes actually written (may be less than src.len if full).
     pub fn write(self: *FastQueue, src: []const u8) usize {
         if (self.full) {
@@ -80,8 +79,6 @@ pub const FastQueue = struct {
         return written;
     }
 
-    /// Read data from the ring buffer into dst.
-    /// Returns the number of bytes actually read.
     pub fn read(self: *FastQueue, dst: []u8) usize {
         if (self.isEmpty()) {
             return 0;
@@ -102,9 +99,9 @@ pub const FastQueue = struct {
         return bytes_read;
     }
 
-    /// Peek at the readable data without consuming it.
-    /// Returns a slice that can be used for direct I/O operations.
-    /// Note: Due to wrapping, this might return less than available() bytes.
+    /// peek at the readable data without consuming it.
+    /// returns a slice that can be used for direct i/o operations.
+    /// NOTE: due to wrapping, this might return less than available() bytes.
     pub fn peekReadable(self: *const FastQueue) []const u8 {
         if (self.isEmpty()) {
             return &[_]u8{};

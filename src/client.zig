@@ -2,7 +2,6 @@
 
 const std = @import("std");
 
-/// client state tracked for each connection.
 pub const ClientState = struct {
     fd: std.posix.fd_t,
     authenticated: bool,

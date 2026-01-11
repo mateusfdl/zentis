@@ -1,6 +1,6 @@
 //! Networking helpers and OS abstraction layer.
 //!
-//! This module isolates OS-specific networking logic and provides
+//! it isolates OS-specific networking logic and provides
 //! small, focused helpers for TCP operations.
 
 const std = @import("std");
@@ -27,7 +27,7 @@ pub fn setNonBlocking(fd: std.posix.fd_t) !void {
     _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags | O_NONBLOCK);
 }
 
-/// creates a listening TCP server bound to the given address.
+/// creates a listening TCP server bound to the given address
 /// and sets the socket to non-blocking mode.
 pub fn createServer(address_str: []const u8) !std.net.Server {
     const address = try parseAddress(std.heap.page_allocator, address_str);
@@ -42,7 +42,7 @@ pub fn createServer(address_str: []const u8) !std.net.Server {
     return server;
 }
 
-/// connection represents a client connection with buffering for non-blocking i/o.
+/// client connection with buffering for non-blocking i/o.
 /// it tracks the file descriptor, peer address, read/write buffers, and connection state.
 pub const Connection = struct {
     fd: std.posix.fd_t,

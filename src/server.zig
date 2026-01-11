@@ -129,7 +129,7 @@ pub const Server = struct {
                     };
                 }
             } else {
-                // This is a client connection
+                // IN client connection
                 if (pollfd.revents & std.posix.POLL.IN != 0) {
                     self.handleRead(pollfd.fd) catch |err| {
                         logger.debug("Error reading from fd {}: {}", .{ pollfd.fd, err });
@@ -155,7 +155,6 @@ pub const Server = struct {
 
     fn acceptConnection(self: *Server) !void {
         const accepted = self.listener.accept() catch |err| {
-            // WouldBlock means no connection is ready (shouldn't happen after poll)
             if (err == error.WouldBlock) {
                 return;
             }
@@ -179,7 +178,6 @@ pub const Server = struct {
         var parser = self.parsers.getPtr(fd) orelse return error.ParserNotFound;
 
         const bytes_read = std.posix.read(conn.fd, &conn.read_buf) catch |err| {
-            // WouldBlock means no data available (shouldn't happen after poll)
             if (err == error.WouldBlock) {
                 return;
             }
@@ -246,7 +244,6 @@ pub const Server = struct {
         }
     }
 
-    /// Handle CONNECT message.
     fn handleConnect(self: *Server, fd: std.posix.fd_t, payload: []const u8) !void {
         var client = self.clients.getPtr(fd) orelse return error.ClientNotFound;
 
@@ -262,10 +259,8 @@ pub const Server = struct {
             return;
         };
 
-        // For now, accept any auth token (no real authentication)
         try client.authenticate(auth.auth_token);
 
-        // Send CONNECTED response with connection ID
         var conn_id_buf: [32]u8 = undefined;
         const conn_id = std.fmt.bufPrint(&conn_id_buf, "conn-{}", .{fd}) catch "unknown";
         try self.sendMessageTo(.CONNECTED, conn_id, fd);
@@ -355,7 +350,6 @@ pub const Server = struct {
         }
     }
 
-    /// send a string message to a specific client.
     fn sendMessageTo(self: *Server, msg_type: protocol.MessageType, str: []const u8, fd: std.posix.fd_t) !void {
         const msg_bytes = switch (msg_type) {
             .CONNECTED => try self.msg_builder.buildConnected(str),
