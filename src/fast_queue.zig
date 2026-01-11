@@ -111,16 +111,16 @@ pub const FastQueue = struct {
         }
 
         if (self.write_pos > self.read_pos) {
-            // Simple case: no wrapping
+            // no wrapping
             return self.data[self.read_pos..self.write_pos];
         } else {
-            // Wrapped: return data from read_pos to end
+            // wrapped: return data from read_pos to end
             return self.data[self.read_pos..];
         }
     }
 
-    /// Consume n bytes from the buffer (advance read position).
-    /// This is used after successfully reading from peekReadable().
+    /// consume n bytes from the buffer (advance read position).
+    /// this is used after successfully reading from peekreadable().
     pub fn consume(self: *FastQueue, n: usize) void {
         const available_bytes = self.available();
         const to_consume = @min(n, available_bytes);
@@ -129,7 +129,7 @@ pub const FastQueue = struct {
         self.full = false;
     }
 
-    /// Clear the buffer (reset read and write positions).
+    /// clear the buffer (reset read and write positions).
     pub fn clear(self: *FastQueue) void {
         self.read_pos = 0;
         self.write_pos = 0;
